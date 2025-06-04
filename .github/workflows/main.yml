@@ -1,0 +1,186 @@
+name: build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            tool: aarch64-unknown-linux-musl
+          - arch: arm
+            tool: arm-unknown-linux-musleabi
+          - arch: armhf
+            tool: arm-unknown-linux-musleabihf
+          - arch: armv7
+            tool: armv7-unknown-linux-musleabi
+          - arch: armv7hf
+            tool: armv7-unknown-linux-musleabihf
+          # - arch: loong64
+          #   tool: loongarch64-unknown-linux-musl
+          # - arch: m68k
+          #   tool: m68k-unknown-linux-musl
+          - arch: mips64el
+            tool: mips64el-unknown-linux-musl
+          - arch: mips64
+            tool: mips64-unknown-linux-musl
+          - arch: mipsel
+            tool: mipsel-unknown-linux-musl
+          - arch: mipselsf
+            tool: mipsel-unknown-linux-muslsf
+          - arch: mips
+            tool: mips-unknown-linux-musl
+          - arch: mipssf
+            tool: mips-unknown-linux-muslsf
+          - arch: ppc64
+            tool: powerpc64-unknown-linux-musl
+          - arch: ppc
+            tool: powerpc-unknown-linux-musl
+          - arch: riscv
+            tool: riscv32-unknown-linux-musl
+          - arch: riscv64
+            tool: riscv64-unknown-linux-musl
+          - arch: s390x
+            tool: s390x-ibm-linux-musl
+          # - arch: sh
+          #   tool: sh-multilib-linux-musl
+          - arch: x86
+            tool: i586-unknown-linux-musl
+          - arch: x86_64
+            tool: x86_64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up build tools
+        env:
+          REPO: 'spvkgn/musl-cross'
+          TOOL: ${{ matrix.tool }}
+        run: |
+          mkdir -p $HOME/tools
+          wget -qO- https://github.com/$REPO/releases/download/latest/$TOOL.tar.xz | tar -C $HOME/tools -xJ || exit 1
+          [ -d "$HOME/tools/$TOOL/bin" ] && echo "$HOME/tools/$TOOL/bin" >> $GITHUB_PATH
+      - name: Build
+        id: build
+        env:
+          ARCH: ${{ matrix.arch }}
+          TOOL: ${{ matrix.tool }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sed -i 's/ -O./ -Os/' Makefile
+          CFLAGS="-static-libgcc -static" \
+          LDFLAGS="-static-libgcc -static -s" \
+          make -j$(nproc) CC=$TOOL-gcc LD=$TOOL-ld AR=$TOOL-ar NM=$TOOL-nm STRIP=$TOOL-strip || exit 1
+          tar -czvf byedpi-$ARCH.tar.gz ciadpi
+      - name: Upload artifacts
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: byedpi-${{ matrix.arch }}
+          path: byedpi-*.tar.gz
+
+  build-windows:
+    name: ${{ matrix.arch }}-w64
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [ x86_64, i686 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up build tools
+        run: |
+          sudo apt update -qq && sudo apt install -y mingw-w64
+      - name: Build
+        id: build
+        env:
+          ARCH: ${{ matrix.arch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          make windows CC=$ARCH-w64-mingw32-gcc -j$(nproc) || exit 1
+          $ARCH-w64-mingw32-strip -s ciadpi.exe
+          zip byedpi-$ARCH-w64.zip ciadpi.exe
+      - name: Upload artifacts
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: byedpi-${{ matrix.arch }}-w64
+          path: byedpi-*.zip
+
+  build-cygwin:
+    name: Cygwin ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [ x86_64, x86 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Cygwin
+        uses: cygwin/cygwin-install-action@v4
+        with:
+          platform: ${{ matrix.arch }}
+          site: ${{ matrix.arch == 'x86_64' && 'http://ctm.crouchingtigerhiddenfruitbat.org/pub/cygwin/circa/64bit/2016/08/30/104235' || 'http://ctm.crouchingtigerhiddenfruitbat.org/pub/cygwin/circa/2016/08/30/104223' }}
+          check-sig: 'false'
+          packages: >-
+            gcc-core
+            make
+            zip
+      - name: Build
+        shell: C:\cygwin\bin\bash.exe -eo pipefail '{0}'
+        run: >-
+          export MAKEFLAGS=-j$(nproc) &&
+          make &&
+          zip byedpi-${{ matrix.arch }}-cygwin.zip ciadpi.exe
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: byedpi-${{ matrix.arch }}-cygwin
+          path: byedpi-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [ build-linux, build-windows, build-cygwin ]
+    permissions:
+      contents: write
+    env:
+      tag_name: latest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: GH
+        env:
+          REPO: 'hufrea/byedpi'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete ${{ env.tag_name }} --cleanup-tag -y -R ${{ github.repository }} || true
+          echo "DATE=$(gh api repos/$REPO/commits/main --jq '.commit.committer.date' | date -f - +%Y%m%d)" >> $GITHUB_ENV
+          echo "SHA_SHORT=$(gh api repos/$REPO/commits/main --jq '.sha[:7]')" >> $GITHUB_ENV
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          prerelease: false
+          draft: false
+          tag_name: ${{ env.tag_name }}
+          name: ${{ env.DATE }}
+          body: |
+            * Commit: hufrea/byedpi@${{ env.SHA_SHORT }}
+          target_commitish : main
+          files: |
+            ./**/byedpi-*.tar.gz
+            ./**/byedpi-*.zip
