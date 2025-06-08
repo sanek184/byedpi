@@ -10,8 +10,8 @@ jobs:
     strategy:
       matrix:
         include:
-          # - arch: arm64
-          #   tool: aarch64-unknown-linux-musl
+          - arch: arm64
+            tool: aarch64-unknown-linux-musl
           # - arch: arm
           #   tool: arm-unknown-linux-musleabi
           # - arch: armhf
