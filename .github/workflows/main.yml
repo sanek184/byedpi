@@ -18,8 +18,8 @@ jobs:
           #   tool: arm-unknown-linux-musleabihf
           # - arch: armv7
           #   tool: armv7-unknown-linux-musleabi
-          #  - arch: armv7hf
-          #  tool: armv7-unknown-linux-musleabihf
+          # - arch: armv7hf
+          #   tool: armv7-unknown-linux-musleabihf
           # - arch: loong64
           #   tool: loongarch64-unknown-linux-musl
           # - arch: m68k
@@ -116,8 +116,8 @@ jobs:
           name: byedpi-${{ matrix.arch }}-w64
           path: byedpi-*.zip
 
-release:Add commentMore actions
-    needs: [ build-linux, build-windows, build-cygwin ]
+  release:
+    needs: [ build-windows]
     permissions:
       contents: write
     env:
