@@ -23,8 +23,6 @@
 #include "desync.h"
 #include "packets.h"
 
-#define KEY_SIZE sizeof(union sockaddr_u)
-
 
 static int set_timeout(int fd, unsigned int s)
 {
@@ -48,82 +46,67 @@ static int set_timeout(int fd, unsigned int s)
 
 
 static ssize_t serialize_addr(const union sockaddr_u *dst,
-        uint8_t *const out, const size_t out_len)
+        struct cache_key *out)
 {
-    #define serialize(raw, field, len, counter){ \
-        const size_t size = sizeof(field); \
-        if ((counter + size) <= len) { \
-            memcpy(raw + counter, &(field), size); \
-            counter += size; \
-        } else return 0; \
-    }
-    size_t c = 0;
-    serialize(out, dst->in.sin_port, out_len, c);
-    serialize(out, dst->sa.sa_family, out_len, c);
+    out->port = dst->in.sin_port;
+    out->family = dst->sa.sa_family;
+    static const ssize_t c = offsetof(struct cache_key, ip.v4);
     
     if (dst->sa.sa_family == AF_INET) {
-        serialize(out, dst->in.sin_addr, out_len, c);
-    } else {
-        serialize(out, dst->in6.sin6_addr, out_len, c);
+        out->ip.v4 = dst->in.sin_addr;
+        return c + sizeof(out->ip.v4);
+    } 
+    else {
+        out->ip.v6 = dst->in6.sin6_addr;
+        return c + sizeof(out->ip.v6);
     }
-    #undef serialize
-
-    return c;
-}
-
-
-static void cache_del(const union sockaddr_u *dst)
-{
-    uint8_t key[KEY_SIZE] = { 0 };
-    int len = serialize_addr(dst, key, sizeof(key));
-    
-    INIT_ADDR_STR((*dst));
-    LOG(LOG_S, "delete ip: %s\n", ADDR_STR);
-    mem_delete(params.mempool, (char *)key, len);
 }
 
 
 static struct elem_i *cache_get(const union sockaddr_u *dst)
 {
-    uint8_t key[KEY_SIZE] = { 0 };
-    int len = serialize_addr(dst, key, sizeof(key));
+    struct cache_key key = { 0 };
+    int len = serialize_addr(dst, &key);
     
-    struct elem_i *val = (struct elem_i *)mem_get(params.mempool, (char *)key, len);
+    struct elem_i *val = mem_get(params.mempool, (char *)&key, len);
     if (!val) {
         return 0;
     }
     time_t t = time(0);
-    if (t > val->time + params.cache_ttl) {
+    if (t > val->time + params.cache_ttl || val->dp == params.dp) {
         LOG(LOG_S, "time=%jd, now=%jd, ignore\n", (intmax_t)val->time, (intmax_t)t);
-        mem_delete(params.mempool, (char *)key, len);
+        mem_delete(params.mempool, (char *)&key, len);
         return 0;
     }
     return val;
 }
 
 
-static struct elem_i *cache_add(const union sockaddr_u *dst)
+static struct elem_i *cache_add(
+        const union sockaddr_u *dst, char **host, int host_len)
 {
-    uint8_t key[KEY_SIZE] = { 0 };
-    int len = serialize_addr(dst, key, sizeof(key));
-    
-    INIT_ADDR_STR((*dst));
-    LOG(LOG_S, "save ip: %s\n", ADDR_STR);
+    struct cache_key key = { 0 };
+    int cmp_len = serialize_addr(dst, &key);
     time_t t = time(0);
     
-    char *key_d = malloc(len);
-    if (!key_d) {
+    struct cache_key *data = calloc(1, cmp_len);
+    if (!data) {
         return 0;
     }
-    memcpy(key_d, key, len);
+    memcpy(data, &key, cmp_len);
     
-    struct elem_i *val = (struct elem_i *)mem_add(params.mempool, key_d, len, sizeof(struct elem_i));
+    struct elem_i *val = mem_add(params.mempool, (char *)data, cmp_len, sizeof(struct elem_i));
     if (!val) {
         uniperror("mem_add");
-        free(key_d);
+        free(data);
         return 0;
     }
     val->time = t;
+    if (!val->extra && *host) {
+        val->extra_len = host_len;
+        val->extra = *host;
+        *host = 0;
+    }
     return val;
 }
 
@@ -134,7 +117,11 @@ int connect_hook(struct poolhd *pool, struct eval *val,
     struct desync_params *dp = val->dp, *init_dp;
     if (!dp) {
         struct elem_i *e = cache_get(dst);
-        dp = e ? e->dp : params.dp;
+        if (e) {
+            val->dp_mask = e->dp_mask;
+            dp = e->dp;
+        } else
+            dp = params.dp;
     }
     init_dp = dp;
     
@@ -285,36 +272,90 @@ static bool check_round(const int *nr, int r)
 }
 
 
+static void swop_groups(struct desync_params *dpc, struct desync_params *dpn)
+{
+    if (dpc->fail_count <= dpn->fail_count) {
+        return;
+    }
+    LOG(LOG_S, "swop: %d <-> %d\n", dpc->id, dpn->id);
+    
+    struct desync_params dpc_cp = *dpc;
+    dpc->next = dpn->next;
+    dpc->prev = dpn->prev;
+    
+    dpn->prev = dpc_cp.prev;
+    dpn->next = dpc_cp.next;
+    
+    if (dpn->prev) 
+        dpn->prev->next = dpn;
+    
+    if (dpc->next)
+        dpc->next->prev = dpc;
+    
+    if (dpc_cp.next != dpn) {
+        dpn->next->prev = dpn;
+        dpc->prev->next = dpc;
+    } 
+    else {
+        dpc->prev = dpn;
+        dpn->next = dpc;
+    }
+    dpc->detect = dpn->detect;
+    dpn->detect = dpc_cp.detect;
+    
+    if (params.dp == dpc) params.dp = dpn;
+}
+
+    
 static int on_trigger(int type, struct poolhd *pool, struct eval *val)
 {
-    struct desync_params *dp = val->pair->dp->next;
+    struct desync_params *dp = val->pair->dp;
+    dp->fail_count++;
+    val->pair->dp_mask |= dp->bit;
     
     struct buffer *pair_buff = val->pair->sq_buff;
     bool can_reconn = (
         pair_buff && pair_buff->lock 
             && !val->recv_count
-            && params.auto_level > AUTO_NOBUFF
+            && (params.auto_level & AUTO_RECONN)
     );
-    if (!can_reconn && params.auto_level <= AUTO_NOSAVE) {
+    if (!can_reconn && !(params.auto_level & AUTO_POST)) {
         return -1;
     }
-    for (; dp; dp = dp->next) {
+    INIT_ADDR_STR((val->addr));
+    
+    for (dp = dp->next; dp; dp = dp->next) {
         if (!dp->detect) {
             break;
         }
         if (!(dp->detect & type)) {
             continue;
         }
-        struct elem_i *e = cache_add(&val->addr);
+        if (params.auto_level & AUTO_SORT) {
+            if (dp->bit & val->pair->dp_mask) 
+                continue;
+            else
+                swop_groups(val->pair->dp, dp);
+        }
+        LOG(LOG_S, "save: ip=%s, id=%d\n", ADDR_STR, dp->id);
+        
+        struct elem_i *e = cache_add(&val->addr, &val->pair->host, val->pair->host_len);
         if (e) {
             e->dp = dp;
+            e->dp_mask = val->pair->dp_mask;
         }
         if (can_reconn) {
             return reconnect(pool, val, dp);
         }
         return -1;
     }
-    cache_del(&val->addr);
+    LOG(LOG_S, "unreach ip: %s\n", ADDR_STR);
+    
+    struct elem_i *e = cache_add(&val->addr, &val->pair->host, val->pair->host_len);
+    if (e) {
+        e->dp = params.dp;
+        e->dp_mask = 0;
+    }
     return -1;
 }
 
@@ -381,8 +422,31 @@ static inline void free_first_req(struct poolhd *pool, struct eval *client)
 }
 
 
+static void save_hostname(struct eval *client, const char *buffer, ssize_t n)
+{
+    if (client->host) {
+        return;
+    }
+    char *host = 0;
+    int len = parse_tls(buffer, n, &host);
+    if (!len) {
+        if (!(len = parse_http(buffer, n, &host, 0))) {
+            return;
+        }
+    }
+    if (!(client->host = malloc(len))) {
+        return;
+    }
+    memcpy(client->host, host, len);
+    client->host_len = len;
+}
+
+
 static int setup_conn(struct eval *client, const char *buffer, ssize_t n)
 {
+    if (params.cache_file) {
+        save_hostname(client, buffer, n);
+    }
     struct desync_params *dp = client->dp, *init_dp = dp;
     
     for (; dp; dp = dp->next) {
@@ -397,7 +461,7 @@ static int setup_conn(struct eval *client, const char *buffer, ssize_t n)
         LOG(LOG_E, "drop connection\n");
         return -1;
     }
-    if (params.auto_level > AUTO_NOBUFF && params.dp->next) {
+    if ((params.auto_level & AUTO_POST) && params.dp->next) {
         client->mark = is_tls_chello(buffer, n);
     }
     client->dp = dp;
@@ -415,7 +479,7 @@ static int setup_conn(struct eval *client, const char *buffer, ssize_t n)
 
 static int cancel_setup(struct eval *remote)
 {
-    if (params.timeout && params.auto_level <= AUTO_NOSAVE &&
+    if (params.timeout && !(params.auto_level & AUTO_POST) &&
             set_timeout(remote->fd, 0)) {
         return -1;
     }
@@ -505,7 +569,7 @@ ssize_t tcp_recv_hook(struct poolhd *pool,
     //
     if (val->flag != FLAG_CONN 
             && !val->pair->recv_count 
-            && params.auto_level > AUTO_NOBUFF
+            && (params.auto_level & AUTO_RECONN)
             && (val->sq_buff || val->recv_count == n))
     {
         if (!val->sq_buff) {

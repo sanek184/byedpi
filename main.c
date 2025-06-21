@@ -26,7 +26,7 @@
     #define close(fd) closesocket(fd)
 #endif
 
-#define VERSION "17"
+#define VERSION "17.1"
 
 ASSERT(sizeof(struct in_addr) == 4)
 ASSERT(sizeof(struct in6_addr) == 16)
@@ -58,8 +58,7 @@ struct params params = {
     .laddr = {
         .in = { .sin_family = AF_INET }
     },
-    .debug = 0,
-    .auto_level = AUTO_NOBUFF
+    .debug = 0
 };
 
 
@@ -86,8 +85,9 @@ static const char help_text[] = {
     #endif
     "    -A, --auto <t,r,s,n>      Try desync params after this option\n"
     "                              Detect: torst,redirect,ssl_err,none\n"
-    "    -L, --auto-mode <0|1>     1 - handle trigger after several packets\n"
+    "    -L, --auto-mode <0-3>     Mode: 1 - post_resp, 2 - sort, 3 - 1+2\n"
     "    -u, --cache-ttl <sec>     Lifetime of cached desync params for IP\n"
+    "    -y, --cache-dump <file|-> Dump cache to file or stdout\n"
     #ifdef TIMEOUT_SUPPORT
     "    -T, --timeout <sec>       Timeout waiting for response, after which trigger auto\n"
     #endif
@@ -155,6 +155,7 @@ const struct option options[] = {
     {"timeout",       1, 0, 'T'},
     #endif
     {"copy",          1, 0, 'B'},
+    {"cache-dump",    1, 0, 'y'},
     {"proto",         1, 0, 'K'},
     {"hosts",         1, 0, 'H'},
     {"pf",            1, 0, 'V'},
@@ -308,7 +309,7 @@ static inline int lower_char(char *cl)
 
 struct mphdr *parse_hosts(char *buffer, size_t size)
 {
-    struct mphdr *hdr = mem_pool(1, CMP_HOST);
+    struct mphdr *hdr = mem_pool(MF_STATIC, CMP_HOST);
     if (!hdr) {
         return 0;
     }
@@ -549,6 +550,9 @@ static struct desync_params *add_group(struct desync_params *prev)
         dp->prev = prev;
         prev->next = dp;
     }
+    dp->id = params.dp_n;
+    dp->bit = 1 << dp->id;
+    
     params.dp_n++;
     return dp;
 }
@@ -666,7 +670,7 @@ int main(int argc, char **argv)
         params.baddr.sa.sa_family = AF_INET;
     }
     
-    char *pid_file = 0;
+    const char *pid_file = 0;
     bool daemonize = 0;
     
     int rez;
@@ -765,6 +769,10 @@ int main(int argc, char **argv)
                 invalid = 1;
             break;
             
+        case 'y': //
+            params.cache_file = optarg;
+            break;
+            
         // desync options
         
         case 'F':
@@ -772,11 +780,32 @@ int main(int argc, char **argv)
             break;
             
         case 'L':
-            val = strtol(optarg, &end, 0);
-            if (val < 0 || val > 1 || *end)
-                invalid = 1;
-            else
-                params.auto_level = val;
+            end = optarg;
+            while (end && !invalid) {
+                switch (*end) {
+                    case '0': 
+                        break;
+                    case '1':
+                    case 'p': 
+                        params.auto_level |= AUTO_POST;
+                        break;
+                    case '2':
+                    case 's': 
+                        params.auto_level |= AUTO_SORT;
+                        break;
+                    case 'r':
+                        params.auto_level = 0;
+                        break;
+                    case '3':
+                        params.auto_level |= (AUTO_POST | AUTO_SORT);
+                        break;
+                    default:
+                        invalid = 1;
+                        continue;
+                }
+                end = strchr(end, ',');
+                if (end) end++;
+            }
             break;
             
         case 'A':
@@ -814,11 +843,10 @@ int main(int argc, char **argv)
                 end = strchr(end, ',');
                 if (end) end++;
             }
-            if (dp->detect && params.auto_level == AUTO_NOBUFF) {
-                params.auto_level = AUTO_NOSAVE;
+            if (dp->detect) {
+                params.auto_level |= AUTO_RECONN;
             }
             dp->_optind = optind;
-            dp->id = params.dp_n - 1;
             break;
             
         case 'B':
@@ -1161,7 +1189,9 @@ int main(int argc, char **argv)
             return -1;
         }
     }
-    
+    if ((params.auto_level & AUTO_SORT) && params.dp_n > 64) {
+        LOG(LOG_E, "too many groups!\n");
+    }
     if (params.baddr.sa.sa_family != AF_INET6) {
         params.ipv6 = 0;
     }
@@ -1171,7 +1201,7 @@ int main(int argc, char **argv)
             return -1;
         }
     }
-    params.mempool = mem_pool(0, CMP_BYTES);
+    params.mempool = mem_pool(MF_EXTRA, CMP_BYTES);
     if (!params.mempool) {
         uniperror("mem_pool");
         clear_params();
@@ -1190,6 +1220,21 @@ int main(int argc, char **argv)
     }
     #endif
     int status = run(&params.laddr);
+    
+    for (dp = params.dp; dp; dp = dp->next) {
+        LOG(LOG_S, "group: %d, triggered: %d\n", dp->id, dp->fail_count);
+    }
+    if (params.cache_file) {
+        FILE *f;
+        if (!strcmp(params.cache_file, "-"))
+            f = stdout;
+        else 
+            f = fopen(params.cache_file, "w");
+        if (!f)
+            perror("fopen");
+        else
+            dump_cache(params.mempool, f);
+    }
     clear_params();
     return status;
 }
